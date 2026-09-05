@@ -1,0 +1,76 @@
+# data_provider.py
+import os
+import time
+from datetime import datetime, timedelta
+import pandas as pd
+import akshare as ak
+
+CACHE_DIR = "./stock_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def get_kline_data(symbol: str, lookback_days: int = 250, force_update: bool = False) -> pd.DataFrame:
+    """
+    获取单个标的前复权日K线（带本地Parquet缓存）
+    """
+    file_path = os.path.join(CACHE_DIR, f"{symbol}.parquet")
+    
+    # 1. 优先尝试本地缓存
+    if not force_update and os.path.exists(file_path):
+        try:
+            df = pd.read_parquet(file_path)
+            if not df.empty:
+                # 检查缓存数据是否覆盖到最近5天内
+                latest_date = pd.to_datetime(df['date'].iloc[-1])
+                if (datetime.now() - latest_date).days <= 4:
+                    return df.tail(lookback_days).copy().reset_index(drop=True)
+        except Exception:
+            pass
+
+    # 2. 从 AkShare 远程拉取前复权日线
+    start_date = (datetime.now() - timedelta(days=lookback_days * 2)).strftime("%Y%m%d")
+    try:
+        raw_df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, adjust="qfq")
+        if raw_df is None or raw_df.empty:
+            return pd.DataFrame()
+
+        # 规范化列名
+        rename_map = {
+            "日期": "date", "开盘": "open", "收盘": "close",
+            "最高": "high", "最低": "low", "成交量": "volume"
+        }
+        df = raw_df.rename(columns=rename_map)[list(rename_map.values())]
+        df['date'] = df['date'].astype(str)
+        
+        # 写入本地缓存
+        df.to_parquet(file_path, index=False)
+        return df.tail(lookback_days).copy().reset_index(drop=True)
+    except Exception as e:
+        print(f"[{symbol}] 拉取日K线失败: {e}")
+        return pd.DataFrame()
+
+def get_candidate_pool(sample_limit: int = 150) -> pd.DataFrame:
+    """
+    获取粗筛股票池：
+    1. 剔除 ST、*ST、北交所（代码4/8/92开头，视个人偏好可放开）；
+    2. 剔除今年/近60日未下跌的强庄或多头标的，锁定下跌中继/底部的股票；
+    """
+    print("正在拉取全市场实时快照进行第一轮粗筛...")
+    try:
+        spot_df = ak.stock_zh_a_spot_em()
+        # 过滤 ST
+        mask_st = ~spot_df['名称'].str.contains("ST|退")
+        # 过滤主板/创业板/科创板正常流通股
+        mask_valid_code = spot_df['代码'].str.startswith(('60', '00', '30', '68'))
+        
+        filtered = spot_df[mask_st & mask_valid_code].copy()
+        
+        # 粗筛：从近60日跌幅较大或今年以来表现偏弱的个股中挑选（寻找超跌筑底股）
+        if '60日涨跌幅' in filtered.columns:
+            filtered = filtered[filtered['60日涨跌幅'] < -10.0]
+        
+        # 限制初筛数量以防全网遍历时间过长
+        print(f"粗筛完毕，剩余候选标的 {len(filtered)} 只，准备深度分析前 {sample_limit} 只...")
+        return filtered.head(sample_limit)[['代码', '名称']].reset_index(drop=True)
+    except Exception as e:
+        print(f"全市场粗筛获取失败: {e}")
+        return pd.DataFrame()

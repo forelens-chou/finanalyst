@@ -1,0 +1,22 @@
+# Environment variables
+.env
+*.env
+
+
+# Python cache & bytecode
+__pycache__/
+stock_cache/
+output_charts/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs & databases
+*.log
+*.sqlite
+*.sqlite3
+
