@@ -2,11 +2,19 @@
 import pandas as pd
 import numpy as np
 
-def evaluate_pattern(df: pd.DataFrame, trend_info: dict, is_dual_track: bool = False) -> dict:
+def evaluate_pattern(
+    df: pd.DataFrame, 
+    macro_trend: dict, 
+    sub_trend: dict = None, 
+    time_info: dict = None, 
+    wave_info: dict = None,
+    is_dual_track: bool = False,
+    phase_str: str = "临界变盘"
+) -> dict:
     """
-    变盘评估模型：包含首阳放量判定与多维综合评分
+    V3.0 多维全要素共振评分模型
     """
-    if trend_info is None or len(df) < 50:
+    if macro_trend is None or len(df) < 50:
         return None
 
     # 计算均线
@@ -20,8 +28,8 @@ def evaluate_pattern(df: pd.DataFrame, trend_info: dict, is_dual_track: bool = F
     curr_close = df['close'].iloc[curr_idx]
     curr_open = df['open'].iloc[curr_idx]
     
-    # 压力线理论价
-    line_price_now = trend_info['k'] * curr_idx + trend_info['b']
+    # 宏观理论价与偏差
+    line_price_now = macro_trend['k'] * curr_idx + macro_trend['b']
     distance_pct = (curr_close - line_price_now) / line_price_now * 100
 
     ma_vals = [
@@ -34,64 +42,85 @@ def evaluate_pattern(df: pd.DataFrame, trend_info: dict, is_dual_track: bool = F
     if any(np.isnan(ma_vals)):
         return None
 
-    # 均线粘合度
     ma_spread = (max(ma_vals) - min(ma_vals)) / df['ma20'].iloc[curr_idx] * 100
-    # 跌幅
-    p0_price = trend_info['p0_price']
+    p0_price = macro_trend['p0_price']
     drop_pct = (p0_price - curr_close) / p0_price * 100
 
-    # 门槛条件
-    cond_near_line = -3.0 <= distance_pct <= 2.0
-    cond_ma_converge = ma_spread <= 4.2
-    cond_drop_deep = drop_pct >= 20.0
-    is_matched = cond_near_line and cond_ma_converge and cond_drop_deep
+    # 基础收敛门槛约束（允许回踩确认阶段稍微站在线上方）
+    cond_near_line = -3.5 <= distance_pct <= 3.5
+    cond_ma_converge = ma_spread <= 4.8
+    cond_drop_deep = drop_pct >= 18.0
 
+    is_matched = cond_near_line and cond_ma_converge and cond_drop_deep
     if not is_matched:
         return None
 
-    # =========================================================
-    # 【特性 1：右侧首阳放量异动检测】
-    # =========================================================
-    # 当日收阳（收盘 > 开盘），且收盘涨幅在 0.5% ~ 6.5% 之间
+    # 1. 首阳放量判定
     prev_close = df['close'].iloc[-2] if len(df) >= 2 else curr_close
     pct_change = (curr_close - prev_close) / prev_close * 100
-    is_yang = (curr_close > curr_open) and (0.3 <= pct_change <= 6.5)
+    is_yang = (curr_close > curr_open) and (0.3 <= pct_change <= 7.0)
 
-    # 成交量放大检测：当日成交量较前5日均量放大 1.3 倍以上
     vol_curr = df['volume'].iloc[curr_idx]
     vol_ma5_prev = df['volume'].iloc[-6:-1].mean() if len(df) >= 6 else vol_curr
     vol_ratio = vol_curr / (vol_ma5_prev + 1e-6)
-    
     is_volume_breakout = is_yang and (vol_ratio >= 1.25)
 
-    # =========================================================
-    # 【特性 2：多维综合评分系统（满分 100）】
-    # =========================================================
-    # 基础分 (最高 65 分)：均线越粘合、距离压力线越近得分越高
-    score = 65.0 - (abs(distance_pct) * 4.0 + ma_spread * 3.5)
-    score = max(40.0, score)
+    # 2. 双线共振判定（次级阻力线理论价与贴近度）
+    is_dual_line = False
+    sub_line_price = 0.0
+    if sub_trend:
+        sub_line_price = sub_trend['k'] * curr_idx + sub_trend['b']
+        sub_dist_pct = (curr_close - sub_line_price) / sub_line_price * 100
+        # 现价同时贴近或刚突破次级主跌线
+        if -3.5 <= sub_dist_pct <= 3.5:
+            is_dual_line = True
 
-    # 双轨收敛加成：+20 分
-    if is_dual_track:
-        score += 20.0
+    # 3. 时间周期共振判定
+    is_time_hit = time_info.get('is_time_resonance', False) if time_info else False
+    time_desc = time_info.get('resonance_desc', '无') if time_info else '无'
 
-    # 首阳放量加成：+15 分
-    if is_volume_breakout:
-        score += 15.0
+    # 4. 波浪空间穷竭判定
+    is_wave_hit = wave_info.get('is_wave_exhausted', False) if wave_info else False
+    max_dd = wave_info.get('max_drawdown_pct', 0.0) if wave_info else 0.0
+
+    # =========================================================
+    # 【综合加权评分模型 (满分 100 分)】
+    # =========================================================
+    # 基础分 (最高 40 分)
+    score = 40.0 - (abs(distance_pct) * 2.5 + ma_spread * 2.5)
+    score = max(25.0, score)
+
+    # 加分项 1: 双轨收敛 (+15分)
+    if is_dual_track: score += 15.0
+    # 加分项 2: 首阳放量 (+15分)
+    if is_volume_breakout: score += 15.0
+    # 加分项 3: 时间周期共振 (+10分)
+    if is_time_hit: score += 10.0
+    # 加分项 4: 双重压制线共振 (+10分)
+    if is_dual_line: score += 10.0
+    # 加分项 5: 波浪空间穷竭出清 (+10分)
+    if is_wave_hit: score += 10.0
 
     score = min(100.0, round(score, 1))
 
     return {
         'is_matched': True,
+        'phase': phase_str,
+        'score': score,
         'curr_close': round(curr_close, 2),
         'line_price': round(line_price_now, 2),
+        'sub_line_price': round(sub_line_price, 2) if is_dual_line else 0.0,
         'distance_pct': round(distance_pct, 2),
         'ma_spread': round(ma_spread, 2),
         'drop_pct': round(drop_pct, 2),
         'is_dual_track': "是" if is_dual_track else "否",
         'is_volume_breakout': "是" if is_volume_breakout else "否",
         'vol_ratio': round(vol_ratio, 2),
-        'score': score,
-        'p0_date': trend_info['p0_date'],
+        'is_dual_line': "是" if is_dual_line else "否",
+        'is_time_resonance': "是" if is_time_hit else "否",
+        'time_desc': time_desc,
+        'is_wave_exhausted': "是" if is_wave_hit else "否",
+        'max_drawdown_pct': max_dd,
+        'p0_date': macro_trend['p0_date'],
         'p0_price': round(p0_price, 2)
     }

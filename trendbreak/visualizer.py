@@ -22,7 +22,16 @@ def _setup_chinese_font():
 
 HAS_CHINESE = _setup_chinese_font()
 
-def plot_breakout_pattern(symbol: str, name: str, df: pd.DataFrame, trend_info: dict, result: dict, support_info: dict = None, period: str = "day"):
+def plot_breakout_pattern(
+    symbol: str, 
+    name: str, 
+    df: pd.DataFrame, 
+    macro_trend: dict, 
+    sub_trend: dict, 
+    result: dict, 
+    support_info: dict = None, 
+    period: str = "day"
+):
     save_dir = os.path.join(OUTPUT_BASE_DIR, period)
     os.makedirs(save_dir, exist_ok=True)
 
@@ -31,15 +40,15 @@ def plot_breakout_pattern(symbol: str, name: str, df: pd.DataFrame, trend_info: 
     plot_df.set_index('date', inplace=True)
 
     n = len(plot_df)
-    line_series = np.full(n, np.nan)
-    p0 = trend_info['p0_idx']
+    
+    # 1. 宏观白色压制线
+    macro_series = np.full(n, np.nan)
+    p0 = macro_trend['p0_idx']
     for i in range(p0, n):
-        line_series[i] = trend_info['k'] * i + trend_info['b']
+        macro_series[i] = macro_trend['k'] * i + macro_trend['b']
 
     addplots = [
-        # 白色上轨阻力线
-        mpf.make_addplot(line_series, color='white', width=1.8, linestyle='solid'),
-        # 彩色均线群
+        mpf.make_addplot(macro_series, color='white', width=1.8, linestyle='solid'),
         mpf.make_addplot(plot_df['close'].rolling(5).mean(), color='yellow', width=0.8),
         mpf.make_addplot(plot_df['close'].rolling(10).mean(), color='purple', width=0.8),
         mpf.make_addplot(plot_df['close'].rolling(20).mean(), color='magenta', width=0.9),
@@ -47,7 +56,15 @@ def plot_breakout_pattern(symbol: str, name: str, df: pd.DataFrame, trend_info: 
         mpf.make_addplot(plot_df['close'].rolling(60).mean(), color='cyan', width=1.1)
     ]
 
-    # 若具备双轨收敛，在最近 25 根 K 线下绘制青色水平/微斜支撑虚线
+    # 2. 次级粉色压制线（若存在）
+    if sub_trend:
+        sub_series = np.full(n, np.nan)
+        p_sub = sub_trend['p_sub_idx']
+        for i in range(p_sub, n):
+            sub_series[i] = sub_trend['k'] * i + sub_trend['b']
+        addplots.append(mpf.make_addplot(sub_series, color='magenta', width=1.6, linestyle='solid'))
+
+    # 3. 青色支撑虚线（双轨收敛）
     if result.get('is_dual_track') == "是" and support_info:
         sup_series = np.full(n, np.nan)
         sup_series[-25:] = support_info['support_price']
@@ -61,23 +78,34 @@ def plot_breakout_pattern(symbol: str, name: str, df: pd.DataFrame, trend_info: 
     )
 
     cycle_txt = "日线" if period == "day" else "周线"
-    tag_str = f" [双轨]" if result.get('is_dual_track') == "是" else ""
-    tag_str += f" [首阳放量]" if result.get('is_volume_breakout') == "是" else ""
+    tags = [f"阶段:{result['phase']}", f"评分:{result['score']}"]
+    if result['is_dual_line'] == "是": tags.append("双线共振")
+    if result['is_time_resonance'] == "是": tags.append(f"时间:{result['time_desc']}")
 
+    tag_str = " | ".join(tags)
     if HAS_CHINESE:
-        title = f"[{cycle_txt}] {symbol} {name}{tag_str} | 评分:{result['score']} | 偏差:{result['distance_pct']}% | 均线带宽:{result['ma_spread']}%"
+        title = f"[{cycle_txt}] {symbol} {name} | {tag_str}"
     else:
-        title = f"[{period.upper()}] {symbol}{tag_str} | Score:{result['score']} | Bias:{result['distance_pct']}% | MA Spread:{result['ma_spread']}%"
+        title = f"[{period.upper()}] {symbol} | Phase:{result['phase']} | Score:{result['score']}"
 
     save_path = os.path.join(save_dir, f"{symbol}_{name}.png")
 
-    mpf.plot(
-        plot_df,
-        type='candle',
-        volume=True,
-        addplot=addplots,
-        style=custom_style,
-        title=title,
-        figsize=(12, 6),
-        savefig=save_path
-    )
+    # 修复点：X轴是时间索引，vlines必须传入对应的日期对象
+    plot_kwargs = {
+        'type': 'candle',
+        'volume': True,
+        'addplot': addplots,
+        'style': custom_style,
+        'title': title,
+        'figsize': (12, 6),
+        'savefig': save_path
+    }
+    
+    try:
+        # 正确传入真实日期
+        target_dates = [plot_df.index[p0], plot_df.index[-1]]
+        plot_kwargs['vlines'] = dict(vlines=target_dates, colors='gold', linestyle='-.', linewidths=1.0)
+    except Exception:
+        pass
+
+    mpf.plot(plot_df, **plot_kwargs)
