@@ -4,13 +4,32 @@ import pandas as pd
 from scipy.signal import find_peaks
 
 class TrendlineFitter:
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, code: str = ""):
         self.df = df
         self.n = len(df)
+        self.code = str(code).zfill(6)
+
+        # =========================================================
+        # 【核心矩阵：全市场阶梯式波动率容差体系】
+        # =========================================================
+        if self.code.startswith(('43', '83', '87', '88', '92')):
+            # 北交所 (30% 涨跌幅)
+            self.spike_limit = -0.12  # 上影线虚破容忍度 12%
+            self.touch_limit = 0.065  # 中段触碰判定容差 6.5%
+            self.channel_limit = 8.5
+        elif self.code.startswith(('30', '688')):
+            # 创业板、科创板 (20% 涨跌幅)
+            self.spike_limit = -0.08  # 上影线虚破容忍度 8%
+            self.touch_limit = 0.055  # 中段触碰判定容差 5.5%
+            self.channel_limit = 8.0
+        else:
+            # 沪深主板 (10% 涨跌幅)
+            self.spike_limit = -0.05  # 上影线虚破容忍度 5%
+            self.touch_limit = 0.045  # 中段触碰判定容差 4.5%
+            self.channel_limit = 7.5
 
     def fit_upper_resistance_line(self, min_peak_distance: int = 8, max_penetration_rate: float = 0.03):
-        """拟合宏观主压制线（白色实线，带严格防悬空）"""
-        if self.n < 60:
+        if self.n < 45:
             return None
 
         highs = self.df['high'].values
@@ -18,7 +37,7 @@ class TrendlineFitter:
 
         max_idx = int(np.argmax(highs[:int(self.n * 0.70)]))
         span = self.n - max_idx
-        if span < 35:
+        if span < 30:
             return None
         
         p0_x = max_idx
@@ -53,7 +72,8 @@ class TrendlineFitter:
                 continue
 
             diff = line_vals - sub_highs_segment
-            if np.any(diff < -0.05 * line_vals):
+            # 阶梯式上影线虚破检查
+            if np.any(diff < self.spike_limit * line_vals):
                 continue
 
             # 中段触碰防悬空（20% ~ 80%）
@@ -63,11 +83,11 @@ class TrendlineFitter:
                 mid_highs = highs[mid_start:mid_end]
                 mid_lines = line_vals[(mid_start - p0_x):(mid_end - p0_x)]
                 min_mid_gap = np.min((mid_lines - mid_highs) / mid_lines)
-                if min_mid_gap > 0.045:
+                if min_mid_gap > self.touch_limit:
                     continue
 
             avg_gap = np.mean(diff / line_vals)
-            if avg_gap > 0.15:
+            if avg_gap > 0.16:
                 continue
 
             area = np.sum(np.abs(diff))
@@ -86,31 +106,25 @@ class TrendlineFitter:
         return best_candidate
 
     def fit_secondary_resistance_line(self, macro_trend_info: dict, min_peak_distance: int = 6):
-        """
-        拟合次级主跌压制线（粉色线，如安杰思大B浪顶110周期引出的急跌线）
-        """
-        if macro_trend_info is None or self.n < 60:
+        if macro_trend_info is None or self.n < 45:
             return None
 
         highs = self.df['high'].values
         closes = self.df['close'].values
         p0_idx = macro_trend_info['p0_idx']
 
-        # 在 P0 之后、距当前至少 18 天前，寻找最显著的次顶波峰 P_sub
-        search_segment = highs[p0_idx + 10 : self.n - 18]
-        if len(search_segment) < 15:
+        search_segment = highs[p0_idx + 8 : self.n - 15]
+        if len(search_segment) < 12:
             return None
 
         sub_peaks, _ = find_peaks(search_segment, distance=min_peak_distance)
         if len(sub_peaks) == 0:
             return None
 
-        sub_peaks = sub_peaks + p0_idx + 10
-        # 选取幅度最高的反弹峰值作为大 B 浪次顶
+        sub_peaks = sub_peaks + p0_idx + 8
         p_sub_x = sub_peaks[np.argmax(highs[sub_peaks])]
         p_sub_y = highs[p_sub_x]
 
-        # 寻找 P_sub 之后的外包斜线
         after_sub_highs = highs[p_sub_x:]
         after_peaks, _ = find_peaks(after_sub_highs, distance=5)
         after_peaks = after_peaks + p_sub_x
@@ -133,7 +147,6 @@ class TrendlineFitter:
             sub_closes = closes[p_sub_x:]
             sub_highs = highs[p_sub_x:]
 
-            # 穿透率 <= 4%
             penetrations = np.sum(sub_closes > line_vals * 1.01)
             if penetrations / len(sub_closes) > 0.04:
                 continue
@@ -152,15 +165,14 @@ class TrendlineFitter:
         return best_sub
 
     def check_dual_track_convergence(self, up_trend_info: dict) -> tuple:
-        """双轨收敛判定（检测下轨支撑与通道压缩）"""
-        if up_trend_info is None or self.n < 50:
+        if up_trend_info is None or self.n < 40:
             return False, None
 
         lows = self.df['low'].values
         p0_x = up_trend_info['p0_idx']
         sub_lows = lows[p0_x:]
         
-        if len(sub_lows) < 30:
+        if len(sub_lows) < 20:
             return False, None
 
         half_len = len(sub_lows) // 2
@@ -174,7 +186,7 @@ class TrendlineFitter:
         support_price = np.min(lows[-20:])
         channel_width_pct = (curr_up_line - support_price) / curr_up_line * 100
 
-        is_converged = is_higher_low and (0 < channel_width_pct <= 7.5)
+        is_converged = is_higher_low and (0 < channel_width_pct <= self.channel_limit)
         
         support_info = {
             'support_price': round(support_price, 2),
