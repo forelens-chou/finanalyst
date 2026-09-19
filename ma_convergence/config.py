@@ -44,7 +44,7 @@ class ScreenerConfig:
     CUSTOM_POOL_SKIP_LIQUIDITY: bool = True
 
     # ==================== 6. 网络通信与高并发控制 ====================
-    MAX_WORKERS: int = 12
-    REQUEST_TIMEOUT: float = 4.0
+    MAX_WORKERS: int = 8
+    REQUEST_TIMEOUT: float = 5.0
     MAX_RETRIES: int = 2
     BATCH_SIZE: int = 80

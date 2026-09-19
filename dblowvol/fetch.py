@@ -1,5 +1,6 @@
 """
-行情数据采集与多源 HTTPS 冗余模块 (彻底消灭 501 拦截与超时)
+行情数据采集与多源 HTTPS 冗余模块
+针对海外云服务器（Cloud Shell）优化，修复腾讯快照PE字段与超时卡死
 """
 
 import json
@@ -10,7 +11,6 @@ import re
 import time
 from typing import List, Optional, Tuple
 
-import akshare as ak
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -59,7 +59,7 @@ class DataFetcher:
     # ---------------- 1. 外部文档解析 ----------------
     def load_symbols_from_file(self, file_path: str) -> List[Tuple[str, str, str]]:
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"未找到文件: {file_path}")
+            raise FileNotFoundError(f"未找到股票代码文件: {file_path}")
 
         logger.info(f"正在读取外部股票池文件: {file_path}")
         content = ""
@@ -85,52 +85,66 @@ class DataFetcher:
                     extracted_codes.add(clean_code)
 
         symbols = [(self.to_full_symbol(c), c, "") for c in sorted(extracted_codes)]
-        logger.info(f"成功提取到 {len(symbols)} 只合规代码")
+        logger.info(f"成功从文件提取到 {len(symbols)} 只合规代码")
         return symbols
 
-    # ---------------- 2. 全市场代码获取 ----------------
+    # ---------------- 2. 全市场代码获取（免国内接口卡死海外IP） ----------------
     def get_market_symbols(self) -> List[Tuple[str, str, str]]:
         logger.info("正在获取全市场基础代码清单...")
-        try:
-            df = ak.stock_info_a_code_name()
-            if df is not None and len(df) > 4000:
-                symbols = []
-                for _, row in df.iterrows():
-                    pure_code = str(row["code"]).strip().zfill(6)
-                    name = str(row["name"]).strip()
-                    symbols.append((self.to_full_symbol(pure_code), pure_code, name))
-                return symbols
-        except Exception:
-            pass
-
         symbols = []
-        for node in ["hs_a", "bse"]:
-            page = 1
-            while page <= 60:
-                url = f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page={page}&num=100&sort=symbol&asc=1&node={node}"
-                try:
-                    resp = self.market_session.get(url, timeout=self.cfg.REQUEST_TIMEOUT)
+
+        # 源1：新浪分批快照源（海外 Cloud Shell 最稳定）
+        try:
+            for node in ["hs_a", "bse"]:
+                page = 1
+                while page <= 65:
+                    url = f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page={page}&num=100&sort=symbol&asc=1&node={node}"
+                    resp = self.market_session.get(url, timeout=3.0)
+                    if resp.status_code != 200:
+                        break
                     data = resp.json()
                     if not data or not isinstance(data, list):
                         break
                     for item in data:
                         full_sym = str(item["symbol"]).lower()
                         pure_code = re.sub(r'^[a-z]+', '', full_sym).zfill(6)
-                        symbols.append((full_sym, pure_code, item["name"]))
+                        symbols.append((full_sym, pure_code, item.get("name", "")))
                     page += 1
-                except Exception:
-                    break
+            if len(symbols) > 1000:
+                logger.info(f"成功获取全市场代码: {len(symbols)} 只 (新浪源)")
+                return symbols
+        except Exception as e:
+            logger.debug(f"新浪节点获取失败: {e}")
+
+        # 源2：降级走 AKShare（设置极短超时，防止海外无响应卡死）
+        try:
+            import akshare as ak
+            df = ak.stock_info_a_code_name()
+            if df is not None and len(df) > 4000:
+                for _, row in df.iterrows():
+                    pure_code = str(row["code"]).strip().zfill(6)
+                    name = str(row["name"]).strip()
+                    symbols.append((self.to_full_symbol(pure_code), pure_code, name))
+                logger.info(f"成功获取全市场代码: {len(symbols)} 只 (AKShare源)")
+                return symbols
+        except Exception:
+            pass
+
+        logger.warning(f"全市场接口受限，仅拉取到 {len(symbols)} 只代码")
         return symbols
 
-    # ---------------- 3. 快照初筛 ----------------
-    def prefilter_pool(self, raw_symbols: List[Tuple[str, str, str]], skip_liquidity: bool = False) -> List[dict]:
+    # ---------------- 3. 快照初筛（修复PE下标 39 与 len<40） ----------------
+    def prefilter_pool(self, raw_symbols: List[Tuple[str, str, str]]) -> List[dict]:
         filtered = []
         batch_size = 80
+
+        if not raw_symbols:
+            logger.error("待筛查股票列表为空，请检查网络或提供 stocks.txt 文件！")
+            return []
 
         for i in range(0, len(raw_symbols), batch_size):
             batch = raw_symbols[i : i + batch_size]
             query_param = ",".join([s[0].lower() for s in batch])
-            # 改用稳定快照地址
             url = f"https://qt.gtimg.cn/q={query_param}"
             try:
                 resp = self.market_session.get(url, timeout=self.cfg.REQUEST_TIMEOUT)
@@ -143,43 +157,56 @@ class DataFetcher:
                         continue
                     symbol = m.group(1).lower()
                     fields = m.group(2).split("~")
-                    if len(fields) < 39:
+                    
+                    # 腾讯行情核心字段达到 40 个即包含市盈率
+                    if len(fields) < 40:
                         continue
 
                     pure_code = re.sub(r'^[a-z]+', '', symbol).zfill(6)
                     name = fields[1]
-                    amount = float(fields[37] or 0) * 10000
-                    turnover = float(fields[38] or 0)
+                    latest_price = float(fields[3] or 0)
+                    amount = float(fields[37] or 0) * 10000  # 成交额 (元)
+                    
+                    # 关键修复：腾讯接口下标 39 为市盈率 PE(TTM/动态)
+                    pe_raw = fields[39].strip()
 
-                    if "退" in name:
+                    # 1. 过滤退市与风险警示
+                    if any(k in name for k in ["退", "ST", "*ST"]):
                         continue
 
-                    if not skip_liquidity:
-                        if any(k in name for k in ["ST", "*ST"]):
-                            continue
-                        if symbol.startswith("bj"):
-                            if not (turnover >= self.cfg.BSE_MIN_TURNOVER and amount >= self.cfg.BSE_MIN_AMOUNT):
-                                continue
-                        else:
-                            cond1 = amount >= self.cfg.MAIN_MIN_AMOUNT
-                            cond2 = (turnover >= self.cfg.MAIN_MIN_TURNOVER) and (amount >= self.cfg.MAIN_ALT_AMOUNT)
-                            if not (cond1 or cond2):
-                                continue
+                    # 2. 过滤停牌（最新价为0或成交额为0）
+                    if latest_price <= 0 or amount == 0:
+                        continue
+
+                    # 3. 基础流动性保护（防止零成交死水股）
+                    if amount < getattr(self.cfg, "MIN_AMOUNT", 3000000.0):
+                        continue
+
+                    # 4. 市盈率过滤
+                    try:
+                        pe_val = float(pe_raw) if pe_raw else 0.0
+                    except ValueError:
+                        pe_val = 0.0
+
+                    if not (self.cfg.MIN_PE_TTM <= pe_val <= self.cfg.MAX_PE_TTM):
+                        continue
 
                     filtered.append({
                         "symbol": symbol,
                         "code": pure_code,
                         "name": name,
+                        "latest_price": latest_price,
+                        "pe_ttm": pe_val,
+                        "amount": amount
                     })
             except Exception as e:
                 logger.debug(f"快照批量异常: {e}")
 
-        logger.info(f"快照初筛完成，进入深度形态扫描的活跃标的数: {len(filtered)} 只")
+        logger.info(f"快照初筛完成（已完成PE与基本过滤），进入深度形态分析标的: {len(filtered)} 只")
         return filtered
 
-    # ---------------- 4. 彻底解决 501：全线升级 HTTPS ----------------
+    # ---------------- 4. K 线数据获取 ----------------
     def _fetch_from_tencent_https(self, symbol: str) -> Optional[pd.DataFrame]:
-        """主源: 腾讯 HTTPS 前复权日 K 线"""
         symbol = symbol.lower()
         url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,{self.cfg.KLINE_BARS},qfq"
         resp = self.kline_session.get(url, timeout=self.cfg.REQUEST_TIMEOUT)
@@ -190,7 +217,7 @@ class DataFetcher:
         stock_data = data.get("data", {}).get(symbol, {})
         raw_bars = stock_data.get("qfqday", stock_data.get("day", []))
         if not raw_bars:
-            raise ValueError(f"Tencent empty bars")
+            raise ValueError("Tencent empty bars")
 
         rows = []
         for b in raw_bars:
@@ -207,7 +234,6 @@ class DataFetcher:
         return df.sort_values("date").reset_index(drop=True)
 
     def _fetch_from_sina_https(self, symbol: str) -> Optional[pd.DataFrame]:
-        """备用源: 新浪 HTTPS 日 K 线"""
         symbol = symbol.lower()
         url = (
             f"https://quotes.sina.cn/cn/api/json_v2.php/"
@@ -215,18 +241,14 @@ class DataFetcher:
         )
         resp = self.kline_session.get(url, timeout=self.cfg.REQUEST_TIMEOUT)
         if resp.status_code != 200:
-            # 降级尝试旧节点
-            url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen={self.cfg.KLINE_BARS}"
-            resp = self.kline_session.get(url, timeout=self.cfg.REQUEST_TIMEOUT)
-            if resp.status_code != 200:
-                raise ConnectionError(f"Sina HTTP Status {resp.status_code}")
+            raise ConnectionError(f"Sina HTTP Status {resp.status_code}")
 
         text = resp.text.strip()
         if text.startswith("var"):
             text = text[text.find("=") + 1 :].rstrip(";")
         raw_bars = json.loads(text)
         if not raw_bars or not isinstance(raw_bars, list):
-            raise ValueError(f"Sina empty bars")
+            raise ValueError("Sina empty bars")
 
         rows = []
         for b in raw_bars:
@@ -244,9 +266,8 @@ class DataFetcher:
 
     def get_kline(self, symbol: str) -> Optional[pd.DataFrame]:
         symbol = symbol.lower()
-        time.sleep(random.uniform(0.015, 0.030))
+        time.sleep(random.uniform(0.01, 0.02))
 
-        # 1. 优先走腾讯 HTTPS
         for _ in range(self.cfg.MAX_RETRIES):
             try:
                 df = self._fetch_from_tencent_https(symbol)
@@ -255,7 +276,6 @@ class DataFetcher:
             except Exception:
                 pass
 
-        # 2. 降级走新浪 HTTPS
         for _ in range(self.cfg.MAX_RETRIES):
             try:
                 df = self._fetch_from_sina_https(symbol)
