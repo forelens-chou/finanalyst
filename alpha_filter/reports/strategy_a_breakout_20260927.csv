@@ -1,0 +1,8 @@
+﻿symbol,name,date,close,pct_change,vol_ratio,concentration_ratio,breakout_price,strategy
+sh600189,泉阳泉,2026-09-24,9.1,8.98,2.92,0.0923,8.3,Strategy_A_Breakout
+sh600897,厦门空港,2026-09-24,16.25,8.26,3.9,0.0451,15.59,Strategy_A_Breakout
+sh603073,彩蝶实业,2026-09-24,18.88,4.31,2.88,0.1158,18.1,Strategy_A_Breakout
+sz000905,厦门港务,2026-09-24,9.81,9.49,2.0,0.1165,9.46,Strategy_A_Breakout
+sz002005,德豪润达,2026-09-24,2.8,5.66,2.07,0.1148,2.68,Strategy_A_Breakout
+sz301311,昆船智能,2026-09-24,17.98,19.39,5.52,0.096,15.4,Strategy_A_Breakout
+sz301339,通行宝,2026-09-24,13.45,9.8,4.85,0.101,12.1,Strategy_A_Breakout
